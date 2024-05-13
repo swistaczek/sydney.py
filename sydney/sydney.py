@@ -321,7 +321,7 @@ class SydneyClient:
                     f"Failed to upload image, received status: {response.status}"
                 )
 
-            response_dict = await response.json()
+            response_dict = await response.json(content_type=None)
             if not response_dict["blobId"]:
                 raise ImageUploadException(
                     "Failed to upload image, Copilot rejected uploading it"
@@ -494,7 +494,7 @@ class SydneyClient:
                     f"Failed to create conversation, received status: {response.status}"
                 )
 
-            response_dict = await response.json()
+            response_dict = await response.json(content_type=None)
             if response_dict["result"]["value"] != "Success":
                 raise CreateConversationException(
                     f"Failed to authenticate, received message: {response_dict['result']['message']}"
@@ -822,6 +822,6 @@ class SydneyClient:
                     f"Failed to get conversations, received status: {response.status}"
                 )
 
-            response_dict = await response.json()
+            response_dict = await response.json(content_type=None)
 
         return response_dict
