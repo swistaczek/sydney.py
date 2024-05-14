@@ -7,9 +7,8 @@ from os import getenv
 from typing import AsyncGenerator
 from urllib import parse
 
-import websockets.client as websockets
-from aiohttp import ClientSession, FormData, TCPConnector
-from websockets.client import WebSocketClientProtocol
+from websocket import WebSocket, WebSocketTimeoutException
+from aiohttp import ClientSession, FormData, TCPConnector, BasicAuth
 
 from sydney.constants import (
     BING_BLOB_URL,
@@ -60,6 +59,9 @@ class SydneyClient:
         persona: str = "copilot",
         bing_cookies: str | None = None,
         use_proxy: bool = False,
+        http_proxy_host: str | None = None,
+        http_proxy_auth: str | None = None,
+        http_proxy_port: str | None = None,
     ) -> None:
         """
         Client for Copilot (formerly named Bing Chat), also known as Sydney.
@@ -79,9 +81,26 @@ class SydneyClient:
             Flag to determine if an HTTP proxy will be used to start a conversation with Copilot. If set to True,
             the `HTTP_PROXY` and `HTTPS_PROXY` environment variables must be set to the address of the proxy to be used.
             If not provided, no proxy will be used. Default is False.
+        http_proxy_host: str | None
+            The host of the HTTP proxy to be used. If not provided, no proxy will be used. Default is None.
+        http_proxy_auth: str | None
+            The authentication details of the HTTP proxy to be used. If not provided, no proxy will be used. Default is None.
+        http_proxy_port: str | None
+            The port of the HTTP proxy to be used. If not provided, no proxy will be used. Default is None.
         """
         self.bing_cookies = bing_cookies if bing_cookies else getenv("BING_COOKIES")
+        
         self.use_proxy = use_proxy
+        self.http_proxy_host = http_proxy_host
+        self.http_proxy_auth = http_proxy_auth
+        self.http_proxy_port = http_proxy_port
+        self.http_proxy = None
+        self.http_proxy_basic_auth = None
+        if self.use_proxy and self.http_proxy_host and self.http_proxy_port:
+            self.http_proxy = f"http://{self.http_proxy_host}:{self.http_proxy_port}"
+            if self.http_proxy_auth:
+                self.http_proxy_basic_auth = BasicAuth(self.http_proxy_auth[0], self.http_proxy_auth[1]) 
+
         self.conversation_style: ConversationStyle = ConversationStyle[style.upper()]
         self.conversation_style_option_sets: ConversationStyleOptionSets = (
             ConversationStyleOptionSets[style.upper()]
@@ -94,7 +113,7 @@ class SydneyClient:
         self.invocation_id: int | None = None
         self.number_of_messages: int | None = None
         self.max_messages: int | None = None
-        self.wss_client: WebSocketClientProtocol | None = None
+        self.wss_client: WebSocket() | None = None
         self.session: ClientSession | None = None
 
     async def __aenter__(self) -> SydneyClient:
@@ -118,7 +137,7 @@ class SydneyClient:
                 cookies=cookies,
                 trust_env=self.use_proxy,  # Use `HTTP_PROXY` and `HTTPS_PROXY` environment variables.
                 connector=(
-                    TCPConnector(verify_ssl=False) if self.use_proxy else None
+                    TCPConnector(ssl=False) if self.use_proxy else None
                 ),  # Resolve HTTPS issue when proxy support is enabled.
             )
 
@@ -315,7 +334,7 @@ class SydneyClient:
 
         data = self._build_upload_arguments(attachment, image_base64)
 
-        async with session.post(BING_KBLOB_URL, data=data) as response:
+        async with session.post(BING_KBLOB_URL, data=data, proxy=self.http_proxy, proxy_auth=self.http_proxy_basic_auth) as response:
             if response.status != 200:
                 raise ImageUploadException(
                     f"Failed to upload image, received status: {response.status}"
@@ -363,16 +382,23 @@ class SydneyClient:
             bing_chathub_url += f"?sec_access_token={parse.quote(self.encrypted_conversation_signature)}"
 
         # Create a websocket connection with Copilot for sending and receiving messages.
+        ws = WebSocket()
+
         try:
-            self.wss_client = await websockets.connect(
-                bing_chathub_url, extra_headers=CHATHUB_HEADERS, max_size=None
+            self.wss_client = ws.connect(
+                bing_chathub_url, extra_headers=CHATHUB_HEADERS, max_size=None,
+                http_proxy_host = self.http_proxy_host,
+                http_proxy_auth = self.http_proxy_auth,
+                http_proxy_port = self.http_proxy_port
             )
-        except TimeoutError:
+        except WebSocketTimeoutException:
             raise ConnectionTimeoutException(
                 "Failed to connect to Copilot, connection timed out"
             ) from None
-        await self.wss_client.send(as_json({"protocol": "json", "version": 1}))
-        await self.wss_client.recv()
+
+
+        ws.send(as_json({"protocol": "json", "version": 1}))
+        ws.recv()
 
         attachment_info = None
         if attachment:
@@ -386,11 +412,11 @@ class SydneyClient:
             )
         self.invocation_id += 1
 
-        await self.wss_client.send(as_json(request))
+        ws.send(as_json(request))
 
         streaming = True
         while streaming:
-            objects = str(await self.wss_client.recv()).split(DELIMETER)
+            objects = str(ws.recv()).split(DELIMETER)
             for obj in objects:
                 if not obj:
                     continue
@@ -480,7 +506,7 @@ class SydneyClient:
                     # Exit, type 2 is the last message.
                     streaming = False
 
-        await self.wss_client.close()
+        ws.close()
 
     async def start_conversation(self) -> None:
         """
@@ -488,10 +514,10 @@ class SydneyClient:
         """
         session = await self._get_session(force_close=True)
 
-        async with session.get(BING_CREATE_CONVERSATION_URL) as response:
+        async with session.get(BING_CREATE_CONVERSATION_URL, proxy=self.http_proxy, proxy_auth=self.http_proxy_basic_auth) as response:
             if response.status != 200:
                 raise CreateConversationException(
-                    f"Failed to create conversation, received status: {response.status}"
+                    f"Failed to create conversation, received status: {response.status}, body: {await response.text()}"
                 )
 
             response_dict = await response.json(content_type=None)
@@ -816,7 +842,7 @@ class SydneyClient:
         """
         session = await self._get_session()
 
-        async with session.get(BING_GET_CONVERSATIONS_URL) as response:
+        async with session.get(BING_GET_CONVERSATIONS_URL, proxy=self.http_proxy, proxy_auth=self.http_proxy_basic_auth) as response:
             if response.status != 200:
                 raise GetConversationsException(
                     f"Failed to get conversations, received status: {response.status}"
